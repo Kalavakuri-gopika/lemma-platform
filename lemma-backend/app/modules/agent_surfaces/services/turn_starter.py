@@ -18,6 +18,7 @@ is what those became once nothing needed them to be methods on a namespace.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +34,7 @@ from app.modules.agent_surfaces.domain.ingress_context import (
     SurfaceReplyContext,
 )
 from app.modules.agent_surfaces.domain.groups import SurfaceGroup
+from app.modules.agent_surfaces.domain.models import SurfaceGroupParticipant
 from app.modules.agent_surfaces.domain.ports import SurfaceEventDedupStorePort
 from app.modules.agent_surfaces.infrastructure.adapters.redis_event_dedup_store import (
     get_surface_event_dedup_store,
@@ -76,6 +78,9 @@ from app.modules.agent_surfaces.services.group_log import (
     for_member_run,
     group_background,
     keeps_group_log,
+    RosterReads,
+    live_participants,
+    roster_reads,
 )
 from app.modules.agent_surfaces.services.group_audience import (
     Audience,
@@ -108,6 +113,8 @@ class _RunBackground:
     lines: list[dict[str, object]]
     withheld: int = 0
     audience: Audience | None = None
+    #: Everyone the pod knows is in the group, and whether they are in the pod.
+    participants: tuple[SurfaceGroupParticipant, ...] = ()
 
 
 class SurfaceTurnStarter:
@@ -121,8 +128,10 @@ class SurfaceTurnStarter:
         event_dedup_store: SurfaceEventDedupStorePort | None = None,
         file_ingest_service: SurfaceFileIngestService | None = None,
         pooled_numbers: PooledNumberReader | None = None,
+        roster_reads: RosterReads = roster_reads,
     ) -> None:
         self.uow_factory = uow_factory
+        self.roster_reads = roster_reads
         # `None` reads the pool through each short scope's own unit of work.
         self.pooled_numbers = pooled_numbers
         self.adapter_registry = adapter_registry or SurfacePlatformAdapterRegistry()
@@ -197,6 +206,11 @@ class SurfaceTurnStarter:
                 metadata["channel_context"] = background.lines
             if background.withheld:
                 metadata["channel_context_withheld"] = background.withheld
+            if background.participants:
+                metadata["channel_participants"] = [
+                    participant.model_dump(mode="json")
+                    for participant in background.participants
+                ]
             if background.audience is not None:
                 metadata["outside_audience"] = background.audience.to_metadata()
         elif not context.audience.answers_outsiders:
@@ -341,12 +355,20 @@ class SurfaceTurnStarter:
         if logged is not None:
             lines = [line.model_dump(mode="json") for line in logged.lines]
             withheld, outside = logged.withheld, list(logged.outside_authors)
+            participants = logged.participants
         else:
             lines = await fetch_channel_context(
                 adapter=adapter, context=context, credentials=credentials
             )
             outside = outside_names(lines)
             withheld = 0
+            # A stranger's run acts as nobody, so it is not handed a roster of
+            # who holds access to this pod -- only a member's run is.
+            participants = (
+                ()
+                if context.audience.answers_outsiders
+                else await self._participants_in_live_group(context, lines)
+            )
             if not context.audience.answers_outsiders:
                 lines, withheld = for_member_run(lines)
         # The message being answered was logged on its way in and is already
@@ -364,7 +386,31 @@ class SurfaceTurnStarter:
                 outside_authors=outside,
             )
         )
-        return _RunBackground(lines=lines, withheld=withheld, audience=audience)
+        return _RunBackground(
+            lines=lines,
+            withheld=withheld,
+            audience=audience,
+            participants=participants,
+        )
+
+    async def _participants_in_live_group(
+        self,
+        context: SurfaceChatContext,
+        lines: Sequence[Mapping[str, object]],
+    ) -> tuple[SurfaceGroupParticipant, ...]:
+        """Who the pod can vouch for among a fetched window's speakers."""
+        if context.pod_id is None:
+            return ()
+        return await live_participants(
+            self.uow_factory,
+            lines=lines,
+            pod_id=context.pod_id,
+            platform=context.platform.value,
+            tenant_id=context.event.tenant_id,
+            asker_external_id=context.message_external_user_id,
+            conversation_id=context.conversation_id,
+            reads=self.roster_reads,
+        )
 
     async def _group_background(
         self, context: SurfaceChatContext
@@ -395,6 +441,7 @@ class SurfaceTurnStarter:
                 membership=SqlAlchemySurfaceRoutingResolutionAdapter(uow),
                 agent_display_name=context.agent_display_name,
                 for_stranger=context.audience.answers_outsiders,
+                asker_external_id=context.message_external_user_id,
             )
         return group, logged
 
