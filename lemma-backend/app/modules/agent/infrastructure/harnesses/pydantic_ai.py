@@ -52,13 +52,14 @@ from app.modules.agent.domain.value_objects import (
     MessageDraft,
     to_json_value,
 )
-from pydantic_ai.capabilities import ProcessHistory
-
 from app.modules.agent.capabilities.outsider_gate import OutsiderToolGateCapability
 from app.modules.agent.capabilities.run_notices import RunNoticeCapability
-from app.modules.agent.infrastructure.harnesses.history import build_history_processors
+from app.modules.agent.infrastructure.harnesses.history import history_capabilities
 from app.modules.agent.infrastructure.harnesses.pydantic_ai_history import (
     history_and_prompt,
+)
+from app.modules.agent.infrastructure.harnesses.pydantic_ai_thinking import (
+    replays_prior_run_reasoning,
 )
 from app.modules.agent.infrastructure.harnesses.provider_error_log import (
     user_facing_error_message,
@@ -71,7 +72,7 @@ from app.modules.agent.services.runtime_model_factory import (
     provider_model_settings,
 )
 from app.modules.agent.services.summarization_model import (
-    resolve_summarization_model,
+    lazy_compaction_target,
 )
 from app.modules.agent.tools.final_answer.final_answer_text import final_answer_text
 from app.modules.agent.tools.final_answer.final_answer_tool import FinalAgentResult
@@ -140,8 +141,17 @@ class PydanticAIHarness:
 
     kind = HarnessKind.LEMMA
 
-    def __init__(self, *, emit_tokens: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        emit_tokens: bool = True,
+        model: Model | None = None,
+    ) -> None:
         self.emit_tokens = emit_tokens
+        # Which model a run talks to. The runtime profile decides in production;
+        # a test hands in a scripted model here rather than replacing a name
+        # inside this module.
+        self._model = model
 
     async def run[DepsT: AgentContext](
         self,
@@ -202,11 +212,12 @@ class PydanticAIHarness:
                 agent_run_id=agent_run_id,
             )
         except UnexpectedModelBehavior as exc:
-            # Reached only when a tool genuinely failed every retry (default 5) —
-            # GracefulToolset turns ordinary execution errors into tool responses,
-            # so this is the rare "model kept sending invalid arguments" case.
+            # Two causes, told apart by `classify_run_failure`: a tool that kept
+            # getting invalid arguments past every retry (GracefulToolset turns
+            # ordinary execution errors into tool responses), or a response the
+            # output cap cut off before it held anything usable.
             logger.warning(
-                "agent.pydantic_ai.agent_run_ended_after_repeated.degraded",
+                "agent.pydantic_ai.agent_run_ended_on_unusable_response.degraded",
                 exc_info=True,
             )
             terminal = AgentEvent(
@@ -283,32 +294,33 @@ class PydanticAIHarness:
     ) -> AsyncIterator[AgentEvent]:
         with run_phase("history_convert") as history_span:
             history, user_prompt = self._history_and_prompt(
-                messages, protocol=_runtime_profile_protocol(options)
+                messages,
+                protocol=_runtime_profile_protocol(options),
+                current_run_id=agent_run_id,
+                replay_prior_run_reasoning=replays_prior_run_reasoning(
+                    options.extra.get("runtime_profile")
+                ),
             )
             history_span.set_attribute("lemma.history.model_messages", len(history))
         # e2e mock mode swaps only the model — the rest of the harness (tool
         # execution, streaming, events, persistence) runs for real.
-        if is_mock_llm_enabled():
+        if self._model is not None:
+            model = self._model
+        elif is_mock_llm_enabled():
             model = _meter_mock_model(conversation, options)
         else:
             model = _runtime_profile_model(options)
         # The graph driver owns stream resets, history recovery and retry limits.
         # Retrying inside the model would hide connection drops from that driver.
         model = with_external_stream_retries(model)
-        # History processors ride as ProcessHistory capabilities (the
-        # history_processors= kwarg is deprecated in pydantic-ai).
-        with run_phase("summarization_model"):
-            # Falls back to this run's model when HISTORY_SUMMARIZATION_MODEL is
-            # unset, so behaviour is unchanged unless a deployment opts in.
-            summarization_model = await resolve_summarization_model(
-                organization_id=conversation.organization_id,
-                user_id=conversation.user_id,
-                fallback=model,
-            )
-            summarization_model = _meter_compaction_model(summarization_model, options)
-        history_processors = build_history_processors(
-            options,
-            summarization_model=summarization_model,
+        # Falls back to this run's model when HISTORY_SUMMARIZATION_MODEL is
+        # unset, so behaviour is unchanged unless a deployment opts in.
+        summarization_model = lazy_compaction_target(
+            organization_id=conversation.organization_id,
+            user_id=conversation.user_id,
+            run_model=model,
+            run_compaction_settings=options.compaction_model_settings,
+            meter=lambda resolved: _meter_compaction_model(resolved, options),
         )
         capabilities = list(options.capabilities or [])
         # Before the history processors, not after. Capabilities run in
@@ -323,8 +335,12 @@ class PydanticAIHarness:
         # request -- soon enough, since it fires with a fifth of the history
         # budget still to fill.
         capabilities.append(RunNoticeCapability(options.notices))
+        # History processors ride as ProcessHistory capabilities (the
+        # history_processors= kwarg is deprecated in pydantic-ai), between the
+        # measurement of what else the request carries and the fitting of its
+        # reply budget to what is left.
         capabilities.extend(
-            ProcessHistory(processor) for processor in history_processors
+            history_capabilities(options, summarization_model=summarization_model)
         )
         # Last, so it sees the final tool list: on a stranger's run, whatever
         # every assembler above left in, only the allow-listed names survive.
@@ -345,6 +361,7 @@ class PydanticAIHarness:
 
         def _new_run_context(
             resume_history: list[ModelMessage] | None,
+            attempt_settings: JsonObject | None,
         ) -> AbstractAsyncContextManager[AgentRun[DepsT, object]]:
             # Resuming already carries the user prompt in its message history.
             return pydantic_agent.iter(
@@ -353,6 +370,9 @@ class PydanticAIHarness:
                 if resume_history is not None
                 else (history or None),
                 deps=ctx,
+                # A retry may ask for a shorter answer than the run's own
+                # settings do; merged over them, not in place of them.
+                model_settings=provider_model_settings(attempt_settings),
                 usage_limits=options.usage_limits,
                 conversation_id=str(conversation.id),
             )
@@ -400,7 +420,7 @@ class PydanticAIHarness:
                     stream_reset=lambda: self._stream_reset_event(agent_run_id),
                     stopped=streamer.stopped_event,
                     should_stop=streamer.stop_requested,
-                    emit_usage=node_loop.emit_usage,
+                    shorter_answer_settings=node_loop.shorter_answer_settings,
                 )
             except BaseException as exc:  # noqa: BLE001 — relayed to parent below
                 # Includes CancelledError from our own task.cancel(). pydantic's
@@ -459,8 +479,15 @@ class PydanticAIHarness:
         messages: Sequence[Message],
         *,
         protocol: str | None = None,
+        current_run_id: UUID | None = None,
+        replay_prior_run_reasoning: bool = False,
     ) -> tuple[list[ModelMessage], str | None]:
-        return history_and_prompt(messages, protocol=protocol)
+        return history_and_prompt(
+            messages,
+            protocol=protocol,
+            current_run_id=current_run_id,
+            replay_prior_run_reasoning=replay_prior_run_reasoning,
+        )
 
     def _final_output_message(
         self,
@@ -537,10 +564,6 @@ def _runtime_profile_model[DepsT](options: HarnessOptions[DepsT]) -> Model:
         runtime_credentials=credentials if isinstance(credentials, Mapping) else None,
         fallback_model_name=options.model_name,
     )
-
-
-# Every usage field the harness reports, in one place so a retry can carry all of
-# them forward without the accumulator and the emitter drifting apart.
 
 
 def _meter_mock_model[DepsT](

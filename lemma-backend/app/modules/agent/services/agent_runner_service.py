@@ -58,7 +58,11 @@ from app.modules.agent.services.outsider_runtime import (
     default_runtimes,
     in_process_runtime,
 )
-from app.modules.agent.services.run_limits import budget_for_run, make_stop_checker
+from app.modules.agent.services.run_limits import (
+    budget_for_run,
+    harness_usage_limits,
+    make_stop_checker,
+)
 from app.modules.agent.services.run_message_writer import RunMessageWriter
 from app.modules.agent.services.run_phase_spans import (
     observe_first_output,
@@ -102,9 +106,12 @@ from app.modules.agent.tools.final_answer import get_final_answer_tool
 from app.modules.agent.tools.tool_assembler import RunToolAssembler
 from app.core.crypto import get_secret_cipher
 from app.modules.agent.services.run_input_settings import (
-    profile_model_settings,
     run_input_text,
     with_reply_budget,
+)
+from app.modules.agent.services.generation_settings import (
+    record_generation_settings,
+    run_generation_settings,
 )
 
 logger = get_logger(__name__)
@@ -133,7 +140,7 @@ class AgentRunnerService:
         self.uow_factory = uow_factory
         self.harness_registry = harness_registry
         self.fallback_model_name = fallback_model_name
-        self.fixed_usage_limits = fixed_usage_limits or UsageLimits(request_limit=200)
+        self.fixed_usage_limits = fixed_usage_limits or harness_usage_limits()
         self.tool_assembler = RunToolAssembler(uow_factory)
         self.usage_recorder = RunUsageRecorder(uow_factory)
         self.message_writer = RunMessageWriter(uow_factory)
@@ -211,10 +218,17 @@ class AgentRunnerService:
             harness_toolsets: list[AbstractToolset[ConversationContext]] = full_toolsets
             harness_capabilities: list[AgentCapability[ConversationContext]] = []
             harness_model_settings: JsonObject | None = None
+            compaction_model_settings: JsonObject | None = None
+            lighter_reasoning_settings: JsonObject | None = None
+            # Agent Host harnesses run their own model loop, so none of this
+            # reaches them; the settings stay on the run as a record only.
+            generation = run_generation_settings(
+                resolved_runtime, agent_run.agent_runtime
+            )
             if resolved_runtime.harness_kind == HarnessKind.LEMMA:
-                harness_model_settings = profile_model_settings(
-                    runtime_profile_snapshot
-                )
+                harness_model_settings = generation.model_settings
+                compaction_model_settings = generation.compaction_model_settings
+                lighter_reasoning_settings = generation.lighter_reasoning_settings
                 # The in-process harness realizes every tool surface as a
                 # capability, so its toolset list is empty.
                 harness_capabilities = await build_lemma_harness_tooling(
@@ -255,6 +269,8 @@ class AgentRunnerService:
                 model_settings=with_reply_budget(
                     harness_model_settings, context_budget
                 ),
+                compaction_model_settings=compaction_model_settings,
+                lighter_reasoning_settings=lighter_reasoning_settings,
                 usage_limits=enforced_usage_limits,
                 output_type=self._resolve_output_type(agent, conversation),
                 should_stop=make_stop_checker(
@@ -265,6 +281,7 @@ class AgentRunnerService:
                     context_budget.summarization_token_limit
                 ),
                 history_hard_token_ceiling=context_budget.hard_token_ceiling,
+                context_window=context_budget.window,
                 extra={
                     "runtime_profile": runtime_profile_snapshot,
                     "runtime_credentials": runtime_credentials,
@@ -297,6 +314,9 @@ class AgentRunnerService:
                     span.set_attribute(
                         "gen_ai.request.model",
                         resolved_runtime.model_name_for_harness,
+                    )
+                    record_generation_settings(
+                        span, generation.effective, options.model_settings
                     )
                     # Trace summaries let operators identify a turn without opening it.
                     record_span_input(span, run_input_text(messages))
