@@ -4035,7 +4035,8 @@
                 "TARGET_GONE",
                 "DEADLINE",
                 "ANSWERED",
-                "CANCELLED"
+                "CANCELLED",
+                "TARGET_NEEDS_INPUT"
               ],
               "type": "string"
             },
